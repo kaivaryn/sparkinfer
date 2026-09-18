@@ -5025,14 +5025,33 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // quantize of hn feeds both gate and up; a second feeds down. Scratch comes from the
             // verify arena, so it is sized for N rows and released with the rest of the pass.
             // Wide packed batch: one block-scaled GEMM per projection instead of chunked
-            // row-GEMVs. Gated on a row count the GEMM actually wants (its A-quantizer requires
-            // m % 8 == 0), and on the prefill fp4 operands being resident -- they are whenever
-            // SPARKINFER_QWEN38_PREFILL_NVFP4 is on. The floor was 16, fitted when the GEMM
-            // still ran its prefill tiling at these widths; since the transposed orientation it
-            // is ahead of the row-GEMVs at 8 rows too (cb-decode@c8 558.7 -> 587.4 tok/s).
+            // row-GEMVs. Gated on the prefill fp4 operands being resident -- they are whenever
+            // SPARKINFER_QWEN38_PREFILL_NVFP4 is on. The floor was 16, fitted when the GEMM still
+            // ran its prefill tiling at these widths, then 8 once the transposed orientation made
+            // it ahead of the row-GEMVs there (cb-decode@c8 558.7 -> 587.4 tok/s).
+            //
+            // FOUR, not eight. The eight was read as the A-quantizer's m % 8 == 0 requirement,
+            // but that requirement is already met by Ng above, which rounds m up to the next
+            // multiple of eight -- this arm has always run with pad rows at every width that is
+            // not a multiple of eight (N=12 quantizes and multiplies sixteen rows today), and the
+            // block-scaled M tile is 128 rows whatever m is, so four rows cost the GEMM exactly
+            // what eight do. The floor was therefore a fitted number, not a structural one, and it
+            // was never re-fitted after the transposed orientation landed. Below it a packed step
+            // falls back to the row-GEMVs, whose cost is per row: that is the whole reason a
+            // six-wide step (17.71 ms) is SLOWER than an eight-wide one (15.09 ms) on main.
+            // Measured on the unsloth NVFP4 checkpoint, cb decode agg_tok_s:
+            //
+            //     c2  157.8 -> 157.8  (unchanged: the arm cannot fire below the floor)
+            //     c4  264.9 -> 277.4  +4.7%
+            //     c6  329.1 -> 357.7  +8.7%
+            //     c8  505.5 -> 505.8  (unchanged: already above the old floor)
+            //
+            // Two is past the other side of it -- there the flat GEMM no longer covers the
+            // row-GEMVs it replaces (c2 157.8 -> 156.8) -- so the floor is exactly four.
+            // SPARKINFER_FFN_GEMM_MIN_ROWS=8 restores main.
             static const int kFfnGemmMinRows = [] {
                 const char* e = getenv("SPARKINFER_FFN_GEMM_MIN_ROWS");
-                const int v = e ? atoi(e) : 8;
+                const int v = e ? atoi(e) : 4;
                 return v < 1 ? 1 : v;
             }();
             const bool ffn_gemm = packed && topk == 1 && fp4_a && fp4_asf &&
