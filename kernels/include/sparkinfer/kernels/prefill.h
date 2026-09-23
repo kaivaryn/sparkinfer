@@ -108,17 +108,22 @@ void launch_dflash_gdn_scan(const void* q, const void* k, const void* v,
 
 // Verification-only forms: produce every candidate activation from the live state without
 // mutating it or writing O(N * state_size) checkpoints. The compact inputs are committed later.
+// branch_src/branch_at: tree drafting. Rows [branch_at, n_tokens) are SIBLINGS whose only
+// in-block predecessor is row branch_src, not the row physically before them. -1/-1 (the
+// default) is the plain chain and compiles to the previous kernel exactly.
 void launch_dflash_gdn_conv_compact(const void* qkv, const void* conv_w,
                                     const void* live_state, void* q, void* k, void* v,
                                     int n_tokens, int q_heads, int v_heads, int head_dim,
-                                    int conv_kernel, float eps, cudaStream_t stream = nullptr);
+                                    int conv_kernel, float eps, cudaStream_t stream = nullptr,
+                                    int branch_src = -1, int branch_at = -1);
 
 void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     const void* alpha, const void* beta,
                                     const void* dt, const void* a, const float* live_state,
                                     void* out, int n_tokens, int q_heads, int v_heads,
                                     int head_dim, bool qh_block = false,
-                                    cudaStream_t stream = nullptr);
+                                    cudaStream_t stream = nullptr,
+                                    int branch_src = -1, int branch_at = -1);
 
 // Compact accepted-prefix commit. Verification retains qkv plus k/v/alpha/beta per GDN layer;
 // these launchers update the live decode state once after posterior selection, avoiding both

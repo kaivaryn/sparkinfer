@@ -653,14 +653,24 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
 // DFlash verification scan. Arithmetic and reduction order match pf_gdn_scan_kernel, but the
 // register state is seeded from decode and each candidate's post-token state is checkpointed.
 // The live state is read-only, so a rejected suffix never needs rollback or replay.
-template <int COLS, int HEAD_DIM, bool WRITE_CHECKPOINT>
+// BRANCH (tree drafting): the verify block stops being a single chain when it carries a sibling
+// proposal. The sibling shares its parent's position, so its recurrence must continue from the
+// state after row `branch_src` rather than from the row before it. Both indices are compile-time
+// absent unless BRANCH, so the non-tree instantiation is the previous kernel byte for byte --
+// there is no extra register, no extra compare and no extra load in it.
+//
+// Stashing in REGISTERS rather than materialising a global checkpoint is what keeps this free:
+// the state a branch needs is already live in sloc[] at row branch_src, and NROW is 4 at
+// HEAD_DIM=128, so the whole mechanism is four more registers on a kernel that has them.
+template <int COLS, int HEAD_DIM, bool WRITE_CHECKPOINT, bool BRANCH = false>
 __global__ void df_gdn_scan_checkpoint_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ alpha,
     const __nv_bfloat16* __restrict__ beta, const __nv_bfloat16* __restrict__ dt,
     const __nv_bfloat16* __restrict__ a, const float* __restrict__ live_state,
     __nv_bfloat16* __restrict__ out, float* __restrict__ checkpoints,
-    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16) {
+    int n_tokens, int q_heads, int v_heads, bool qh_block, bool state_bf16,
+    int branch_src = -1, int branch_at = -1) {
     constexpr int NROW = HEAD_DIM / 32;
     const int vh = blockIdx.x;
     const int j = blockIdx.y * COLS + (threadIdx.x >> 5);
@@ -678,8 +688,16 @@ __global__ void df_gdn_scan_checkpoint_kernel(
     float sloc[NROW];
     #pragma unroll
     for (int r = 0; r < NROW; r++) sloc[r] = live_state[col_off + lane + r * 32];
+    float sbranch[BRANCH ? NROW : 1];
 
     for (int t = 0; t < n_tokens; t++) {
+        if constexpr (BRANCH) {
+            // Restore the parent's post-token state before the sibling row consumes it.
+            if (t == branch_at) {
+                #pragma unroll
+                for (int r = 0; r < NROW; r++) sloc[r] = sbranch[r];
+            }
+        }
         const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
         const float g = __expf(pf_softplus(pf_to_f(alpha[(size_t)t * v_heads + vh]) + dt_h) * a_h);
         const __nv_bfloat16* qp = q + (size_t)t * q_dim + qh * HEAD_DIM;
@@ -706,6 +724,12 @@ __global__ void df_gdn_scan_checkpoint_kernel(
         }
         const float y = pf_wsum(part_y);
         if (lane == 0) out[(size_t)t * v_dim + vh * HEAD_DIM + j] = __float2bfloat16(y);
+        if constexpr (BRANCH) {
+            if (t == branch_src) {
+                #pragma unroll
+                for (int r = 0; r < NROW; r++) sbranch[r] = sloc[r];
+            }
+        }
     }
 }
 
@@ -861,13 +885,18 @@ __global__ void df_gdn_conv_checkpoint_kernel(
 // token's tap last -- the order the single-token decode conv uses, which is what keeps the batched
 // verify reproducing AR (see the serial kernel's own comment on #712) -- and the same block
 // reduction for the q/k norm.
-template <bool WRITE_CHECKPOINT>
+// BRANCH (tree drafting): see df_gdn_scan_checkpoint_kernel. This kernel is TOKEN-PARALLEL --
+// every token rebuilds its own conv window from qkv/live_state rather than inheriting one -- so a
+// sibling row needs only an index remap: it sits at local index 1 behind row `branch_src`, and
+// its taps walk (itself, row branch_src, then live_state) instead of its physical predecessors.
+template <bool WRITE_CHECKPOINT, bool BRANCH = false>
 __global__ void df_gdn_conv_par_kernel(
     const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
     const __nv_bfloat16* __restrict__ live_state, __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
     __nv_bfloat16* __restrict__ checkpoints, int n_tokens, int q_heads, int v_heads,
-    int head_dim, int qkv_dim, int conv_kernel, float eps) {
+    int head_dim, int qkv_dim, int conv_kernel, float eps,
+    int branch_src = -1, int branch_at = -1) {
     const int q_dim = q_heads * head_dim;
     const int v_dim = v_heads * head_dim;
     const int blk = blockIdx.x, tok = blockIdx.y, t = threadIdx.x;
@@ -880,12 +909,17 @@ __global__ void df_gdn_conv_par_kernel(
     for (int c = 0; c < 8; c++) w[c] = c < conv_kernel ? pf_to_f(conv_w[(size_t)d * conv_kernel + c]) : 0.f;
     // Window entering token `tok`: tap c is input position tok - (conv_kernel-1) + c. A negative
     // position is decode state, and its live_state row is that position + (conv_kernel-1) = tok+c.
+    // Local index this token occupies in its own chain: itself for the main block, and 1 for a
+    // sibling (whose only in-block predecessor is its parent at row branch_src).
+    const int loc = (BRANCH && tok >= branch_at) ? 1 : tok;
 #pragma unroll
     for (int c = 0; c < 7; c++) {
         if (c >= conv_kernel - 1) { hist[c] = 0.f; continue; }
-        const int p = tok - (conv_kernel - 1) + c;
-        hist[c] = p >= 0 ? pf_to_f(qkv[(size_t)p * qkv_dim + d])
-                         : pf_to_f(live_state[(size_t)(tok + c) * qkv_dim + d]);
+        const int p = loc - (conv_kernel - 1) + c;
+        // p indexes the token's OWN chain; map it back to the physical row that holds it.
+        const int row = (BRANCH && tok >= branch_at) ? (p == 0 ? branch_src : p) : p;
+        hist[c] = p >= 0 ? pf_to_f(qkv[(size_t)row * qkv_dim + d])
+                         : pf_to_f(live_state[(size_t)(loc + c) * qkv_dim + d]);
     }
     const float cur = pf_to_f(qkv[(size_t)tok * qkv_dim + d]);
     float y = 0.f;
@@ -1800,11 +1834,21 @@ void launch_dflash_gdn_scan(const void* q, const void* k, const void* v,
 void launch_dflash_gdn_conv_compact(const void* qkv, const void* conv_w,
                                     const void* live_state, void* q, void* k, void* v,
                                     int n_tokens, int q_heads, int v_heads, int head_dim,
-                                    int conv_kernel, float eps, cudaStream_t stream) {
+                                    int conv_kernel, float eps, cudaStream_t stream,
+                                    int branch_src, int branch_at) {
     if (n_tokens <= 0 || head_dim <= 0 || conv_kernel < 2 || conv_kernel > 8) return;
     const int qkv_dim = 2 * q_heads * head_dim + v_heads * head_dim;
     if (df_gdn_conv_par()) {
-        df_gdn_conv_par_kernel<false><<<dim3(2 * q_heads + v_heads, n_tokens), head_dim, 0, stream>>>(
+        if (branch_at > 0 && branch_src >= 0) {
+            df_gdn_conv_par_kernel<false, true><<<dim3(2 * q_heads + v_heads, n_tokens), head_dim, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
+                reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
+                reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v), nullptr,
+                n_tokens, q_heads, v_heads, head_dim, qkv_dim, conv_kernel, eps,
+                branch_src, branch_at);
+            return;
+        }
+        df_gdn_conv_par_kernel<false, false><<<dim3(2 * q_heads + v_heads, n_tokens), head_dim, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(qkv), reinterpret_cast<const __nv_bfloat16*>(conv_w),
             reinterpret_cast<const __nv_bfloat16*>(live_state), reinterpret_cast<__nv_bfloat16*>(q),
             reinterpret_cast<__nv_bfloat16*>(k), reinterpret_cast<__nv_bfloat16*>(v), nullptr,
@@ -1822,12 +1866,23 @@ void launch_dflash_gdn_scan_compact(const void* q, const void* k, const void* v,
                                     const void* alpha, const void* beta,
                                     const void* dt, const void* a, const float* live_state,
                                     void* out, int n_tokens, int q_heads, int v_heads,
-                                    int head_dim, bool qh_block, cudaStream_t stream) {
+                                    int head_dim, bool qh_block, cudaStream_t stream,
+                                    int branch_src, int branch_at) {
     if (n_tokens <= 0 || head_dim != 128) return;
     constexpr int COLS = 4;
     dim3 grid(v_heads, (head_dim + COLS - 1) / COLS);
     static const bool state_bf16 = [] { const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
                                         return e && e[0] == '1'; }();
+    if (branch_at > 0 && branch_src >= 0) {
+        df_gdn_scan_checkpoint_kernel<COLS, 128, false, true><<<grid, COLS * 32, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
+            reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
+            reinterpret_cast<const __nv_bfloat16*>(beta), reinterpret_cast<const __nv_bfloat16*>(dt),
+            reinterpret_cast<const __nv_bfloat16*>(a), live_state,
+            reinterpret_cast<__nv_bfloat16*>(out), nullptr, n_tokens, q_heads, v_heads, qh_block,
+            state_bf16, branch_src, branch_at);
+        return;
+    }
     df_gdn_scan_checkpoint_kernel<COLS, 128, false><<<grid, COLS * 32, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const __nv_bfloat16*>(k),
         reinterpret_cast<const __nv_bfloat16*>(v), reinterpret_cast<const __nv_bfloat16*>(alpha),
