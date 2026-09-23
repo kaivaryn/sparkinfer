@@ -199,9 +199,13 @@ bool muse_stream_nvfp4_b(int qtype, const void* src, int n, int k,
 
 struct VerifyGraphCache {
     Arena arena;
-    cudaGraph_t graph[kVerifyMaxRows + 1] = {};
-    cudaGraphExec_t exec[kVerifyMaxRows + 1] = {};
-    bool ready[kVerifyMaxRows + 1] = {};
+    // Two banks of tiers: [0, kVerifyMaxRows] for the plain chain and the same range again for
+    // tree steps. A tree step of width W runs a DIFFERENT graph from a chain step of width W --
+    // it carries the sibling's table patch, its own KV append and the branched GDN launches -- so
+    // they must not share a slot.
+    cudaGraph_t graph[2 * (kVerifyMaxRows + 1)] = {};
+    cudaGraphExec_t exec[2 * (kVerifyMaxRows + 1)] = {};
+    bool ready[2 * (kVerifyMaxRows + 1)] = {};
     bool warm = false;
 };
 
@@ -213,7 +217,7 @@ VerifyGraphCache& verify_graph_cache() {
 
 void dflash_release_verify_cache() {
     VerifyGraphCache& cache = verify_graph_cache();
-    for (int t = 1; t <= kVerifyMaxRows; ++t) {
+    for (int t = 1; t < 2 * (kVerifyMaxRows + 1); ++t) {
         if (cache.exec[t]) cudaGraphExecDestroy(cache.exec[t]);
         if (cache.graph[t]) cudaGraphDestroy(cache.graph[t]);
         cache.exec[t] = nullptr;
@@ -3459,7 +3463,7 @@ static void gemv_fp8_rows_any(const bf16* in, const void* w, bf16* out, int rows
 
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
-                            int* out_argmax, bool capture_only) {
+                            int* out_argmax, bool capture_only, int tree_sib_row) {
     const Qwen35Config& c = s.cfg;
     // dense_ffn (Qwen3.8-27B) is accepted alongside the 256-expert MoE (Qwen3.6-35B-A3B) it was
     // written for. A dense SwiGLU is an MoE with ONE expert: AR decode already routes it through
@@ -3856,13 +3860,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     static thread_local int* ph_pos = nullptr;
     static thread_local int* ph_seq = nullptr;
     static thread_local int* ph_out = nullptr;
+    static thread_local int* ph_tree = nullptr;   // {tail logical block, spare logical index}
     // One graph per row count (index 1..kVerifyMaxRows). A single slot meant the verify could
     // only ever replay the width dflash_warm_verify captured, which is why the block width had to
     // be a per-GENERATION constant; with a tier per width the caller can choose it per step.
-    cudaGraph_t (&verify_graph)[kVerifyMaxRows + 1] = graph_cache.graph;
-    cudaGraphExec_t (&verify_exec)[kVerifyMaxRows + 1] = graph_cache.exec;
+    cudaGraph_t (&verify_graph)[2 * (kVerifyMaxRows + 1)] = graph_cache.graph;
+    cudaGraphExec_t (&verify_exec)[2 * (kVerifyMaxRows + 1)] = graph_cache.exec;
     bool& graph_warm = graph_cache.warm;
-    bool (&graph_ready_t)[kVerifyMaxRows + 1] = graph_cache.ready;
+    bool (&graph_ready_t)[2 * (kVerifyMaxRows + 1)] = graph_cache.ready;
     static thread_local const void* graph_model_key = nullptr;
     static thread_local const void* graph_state_key = nullptr;
     static thread_local const void* graph_conv_key = nullptr;
@@ -3929,6 +3934,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         pf_cu(cudaHostAlloc(&ph_pos, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host pos");
         pf_cu(cudaHostAlloc(&ph_seq, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host lens");
         pf_cu(cudaHostAlloc(&ph_out, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "verify host out");
+        pf_cu(cudaHostAlloc(&ph_tree, 2 * sizeof(int), cudaHostAllocDefault), "verify host tree");
     }
     if (verify_head_key != s.w.lm_head && s.w.lm_head_type == 12 && H == 2048) {
         if (verify_head_i8) cudaFree(verify_head_i8);
@@ -3954,6 +3960,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Packed rows each sit at their OWN sequence's next position; verify rows are consecutive.
         ph_pos[i] = packed ? s.packed_pos[i] : start_pos + i;
         ph_seq[i] = ph_pos[i] + 1;
+    }
+    // The sibling is an ALTERNATIVE to row 1, so it occupies row 1's position, not its own. Its
+    // KV length covers the shared prefix plus itself; the table swap below is what stops "itself"
+    // resolving to the first candidate's slot.
+    const bool tree = tree_sib_row > 0 && tree_sib_row == N - 1 && !packed;
+    if (tree) {
+        ph_pos[tree_sib_row] = start_pos + 1;
+        ph_seq[tree_sib_row] = start_pos + 2;
     }
 
     const bf16* q81_src = nullptr;
@@ -4224,6 +4238,18 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // The same per-row gather for the windowed layers' tables. Only allocated when this pool
     // actually caps them, so an uncapped pool carries neither the buffer nor the extra gather.
     int* btab_rows_win = (btab_rows && s.kv->windowed()) ? a.alloc<int>((size_t)NA * mbs) : nullptr;
+    // Tree drafting scratch. Allocated whether or not this call carries a sibling: every buffer
+    // here is sized for the WIDEST tier precisely so the arena layout is identical for all of
+    // them, and a conditional allocation would shift every pointer after it.
+    int* tree_idx  = a.alloc<int>(2);            // device {tail logical block, spare logical idx}
+    int* sib_table = a.alloc<int>((size_t)mbs);  // the sibling's own block table
+    // The sibling's slot lives in the logical block holding start_pos+1; the spare is the first
+    // logical block PAST everything this step touches, which dflash_generate over-allocates so it
+    // is backed by a real physical block. Both are indices, resolved against the device-side
+    // block table by the patch kernel -- the table itself is device memory.
+    const int tree_tail_blk  = (start_pos + 1) / bs;
+    const int tree_spare_idx = (start_pos + N - 1) / bs + 1;
+    const bool tree_ok = tree && tree_spare_idx < mbs;
     if (!a.ok) { fprintf(stderr, "[dflash-verify] block-table scratch allocation failed\n"); return -1; }
     bool supported = true;
     int  vfail_L = -1;   // layer whose stage declined, for the bailout diagnostic below
@@ -4266,9 +4292,12 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         graph_seq_key = seq_key;
         graph_ns_key = ns;
     }
-    if (graph_ready_t[N] && capture_only) return 0;   // this tier is already built
-    if (graph_ready_t[N]) {
-        pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch");
+    // Tier index: tree steps occupy the second bank, so a chain step of the same width keeps its
+    // own graph. See the graph_cache declaration.
+    const int GT = tree_ok ? (kVerifyMaxRows + 1 + N) : N;
+    if (graph_ready_t[GT] && capture_only) return 0;   // this tier is already built
+    if (graph_ready_t[GT]) {
+        pf_cu(cudaGraphLaunch(verify_exec[GT], st), "verify graph launch");
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
         if (vdbg_dump_now) {
@@ -4323,6 +4352,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(ids, ph_ids, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify ids");
     pf_cu(cudaMemcpyAsync(pos, ph_pos, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify pos");
     pf_cu(cudaMemcpyAsync(seq, ph_seq, (size_t)N * sizeof(int), cudaMemcpyHostToDevice, st), "verify lens");
+    ph_tree[0] = tree_tail_blk;
+    ph_tree[1] = tree_spare_idx;
+    pf_cu(cudaMemcpyAsync(tree_idx, ph_tree, 2 * sizeof(int), cudaMemcpyHostToDevice, st), "verify tree idx");
     // Device-to-device inside the capture, so each replay re-reads the sequence's live table as it
     // grows instead of baking in the mapping from capture time. One kernel node rather than N
     // memcpy nodes -- same reason as the capture copies above.
@@ -4332,6 +4364,11 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         else
             dflash_kernels::launch_broadcast_rows_i32(btable, btab_rows, mbs, N, st);
     }
+    // Tree: give the sibling a table of its own (tail block swapped for the spare) and redirect
+    // only its row of the batched table, so attention still runs in ONE launch.
+    if (tree_ok)
+        dflash_kernels::launch_tree_btable_patch(btable, sib_table, btab_rows, mbs,
+                                                 tree_sib_row, tree_idx, st);
     if (btab_rows_win) {
         if (packed && s.packed_rows_win)
             dflash_kernels::launch_gather_rows_i32(s.packed_rows_win, btab_rows_win, mbs, N, st);
@@ -4791,12 +4828,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             } else {
             const bf16* conv_live = static_cast<const bf16*>(s.lin_conv_state) + conv_off;
             kernels::launch_dflash_gdn_conv_compact(rq, w.ssm_conv, conv_live, gq, rk, rv,
-                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st,
+                tree_ok ? 0 : -1, tree_ok ? tree_sib_row : -1);
             const float* state = s.lin_state + state_off;
             // ra/rb are the scan's only side-branch inputs.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join_ab, 0), "verify gdn ab wait");
             kernels::launch_dflash_gdn_scan_compact(gq, rk, rv, ra, rb, w.ssm_dt, w.ssm_a,
-                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st);
+                state, att, N, c.linear_q_heads, vh, c.linear_head_dim, c.gdn_qh_block, st,
+                tree_ok ? 0 : -1, tree_ok ? tree_sib_row : -1);
             }
             // ...and lz is gated_norm's.
             if (split_ok) pf_cu(cudaStreamWaitEvent(st, ev_join, 0), "verify gdn z wait");
@@ -4910,11 +4949,53 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
-                else
+                else if (!tree_ok) {
                     kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
                         b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
+                } else {
+                    // This append resolves its slot from positions[i] through ONE block table, so
+                    // the sibling -- which shares row 1's position -- cannot ride the same launch
+                    // as the chain without overwriting the first candidate's K/V. Split it: the
+                    // chain writes through the real table, the sibling through its own, whose
+                    // tail block is the spare. The spare first takes a copy of the real tail so
+                    // the tokens already sitting in front of the sibling inside that block are
+                    // there for it to attend to.
+                    const size_t kblk = (size_t)bs * c.n_kv_heads * c.head_dim * (kv8 ? 1 : 2);
+                    kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
+                        b8, qb, qg, kf, vf, w.q_norm, w.k_norm, kp, vp, ks, vs, btable, pos,
+                        N - 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                    // ORDER IS LOAD-BEARING: the copy must sit BETWEEN the chain's append and
+                    // the sibling's. The sibling attends to the SEED at position `start`, and the
+                    // seed's K/V is written by THIS step's chain append -- copying the tail block
+                    // beforehand hands the sibling a stale seed slot. It only bites when the stale
+                    // value is different enough to move the argmax, which is why the
+                    // duplicate-sibling self-check caught it as 3 of 64 rather than 64 of 64.
+                    dflash_kernels::launch_tree_block_copy(kp, btable, tree_idx, kblk, st);
+                    dflash_kernels::launch_tree_block_copy(vp, btable, tree_idx, kblk, st);
+                    if (ks) {
+                        // ONE __half per (token, kv_head) -- kv_cache.h: "k_scale_pool/v_scale_pool
+                        // hold one __half scale per head vector". Sizing this as float copied twice
+                        // the bytes and ran off the end of the spare's scale region into the next
+                        // block's, which is a small enough corruption to flip an argmax only
+                        // occasionally (the self-check caught 4 of 64).
+                        const size_t sblk = (size_t)bs * c.n_kv_heads * 2;
+                        dflash_kernels::launch_tree_block_copy(ks, btable, tree_idx, sblk, st);
+                        dflash_kernels::launch_tree_block_copy(vs, btable, tree_idx, sblk, st);
+                    }
+                    const int sr = tree_sib_row;
+                    kernels::launch_dflash_qknorm_rope_kv_partial_int8_gated(
+                        b8 + (size_t)sr * c.n_q_heads * c.head_dim * 2,
+                        qb + (size_t)sr * c.n_q_heads * c.head_dim,
+                        qg + (size_t)sr * c.n_q_heads * c.head_dim,
+                        kf + (size_t)sr * c.n_kv_heads * c.head_dim,
+                        vf + (size_t)sr * c.n_kv_heads * c.head_dim,
+                        w.q_norm, w.k_norm, kp, vp, ks, vs, sib_table, pos + sr,
+                        1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                }
             } else {
                 kernels::launch_prefill_split_q_gate(b8, qb, qg, N, c.n_q_heads, c.head_dim, st);
                 if (packed)
@@ -4922,11 +5003,41 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                         qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btab_rows, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
-                else
+                else if (!tree_ok) {
                     kernels::launch_dflash_qknorm_rope_kv_partial(
                         qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btable, pos,
                         N, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
                         c.rms_eps, bs, mbs, st);
+                } else {
+                    // Same split as the int8 arm above. Leaving this path chain-only was a real
+                    // bug and a quiet one: the sibling's K/V went through the REAL table (landing
+                    // on the first candidate's slot, harmlessly, since it is the same token at the
+                    // same position) while btab_rows still sent the sibling to READ the spare,
+                    // which nothing had seeded. That is ~16 wrong tokens out of 4116 -- too small
+                    // to matter most of the time and decisive about a tenth of the time, which is
+                    // exactly the rate the duplicate-sibling self-check reported (7 of 64).
+                    const size_t kblk = (size_t)bs * c.n_kv_heads * c.head_dim * 2;
+                    kernels::launch_dflash_qknorm_rope_kv_partial(
+                        qb, kf, vf, w.q_norm, w.k_norm, kp, vp, btable, pos,
+                        N - 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                    // ORDER IS LOAD-BEARING: the copy must sit BETWEEN the chain's append and
+                    // the sibling's. The sibling attends to the SEED at position `start`, and the
+                    // seed's K/V is written by THIS step's chain append -- copying the tail block
+                    // beforehand hands the sibling a stale seed slot. It only bites when the stale
+                    // value is different enough to move the argmax, which is why the
+                    // duplicate-sibling self-check caught it as 3 of 64 rather than 64 of 64.
+                    dflash_kernels::launch_tree_block_copy(kp, btable, tree_idx, kblk, st);
+                    dflash_kernels::launch_tree_block_copy(vp, btable, tree_idx, kblk, st);
+                    const int sr = tree_sib_row;
+                    kernels::launch_dflash_qknorm_rope_kv_partial(
+                        qb + (size_t)sr * c.n_q_heads * c.head_dim,
+                        kf + (size_t)sr * c.n_kv_heads * c.head_dim,
+                        vf + (size_t)sr * c.n_kv_heads * c.head_dim,
+                        w.q_norm, w.k_norm, kp, vp, sib_table, pos + sr,
+                        1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        c.rms_eps, bs, mbs, st);
+                }
             }
             // Match the autoregressive decode path exactly. Its fused int8 attention gate is
             // enabled only for the 2048/4096-wide layouts; Qwen3.8 (H=5120) applies sigmoid(g)
@@ -5482,14 +5593,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     pf_cu(cudaMemcpyAsync(ph_out, out_ids, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost, st),
           "verify argmax");
     if (recording) {
-        pf_cu(cudaStreamEndCapture(st, &verify_graph[N]), "verify graph end");
-        pf_cu(cudaGraphInstantiate(&verify_exec[N], verify_graph[N], 0), "verify graph instantiate");
-        graph_ready_t[N] = true;
+        pf_cu(cudaStreamEndCapture(st, &verify_graph[GT]), "verify graph end");
+        pf_cu(cudaGraphInstantiate(&verify_exec[GT], verify_graph[GT], 0), "verify graph instantiate");
+        graph_ready_t[GT] = true;
         graph_warm = true;
         // Nothing ran: capture records the kernels rather than executing them, so the model state
         // is exactly as it was and there is no work to launch or collect.
         if (capture_only) return 0;
-        pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph first launch");
+        pf_cu(cudaGraphLaunch(verify_exec[GT], st), "verify graph first launch");
     }
     pf_cu(cudaStreamSynchronize(st), "verify sync");
     std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));

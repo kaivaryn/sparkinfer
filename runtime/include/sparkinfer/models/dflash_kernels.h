@@ -195,6 +195,14 @@ void launch_gdn_scan_commit_layers(const void* k_base, size_t k_layer_stride,
 void launch_capture_rows(const void* src, void* dst, int rows, int hidden, int dst_row_stride,
                          cudaStream_t stream);
 
+// Tree drafting: redirect a sibling row's paged-KV slot to a spare block. `tail`/`spare` are
+// DEVICE ints because they follow `start` and the verify is CUDA-graph captured.
+// idx is a DEVICE int2: {logical tail block, logical index of the spare}. Both follow `start`,
+// which moves every step, so they cannot be host constants -- the verify is graph-captured.
+void launch_tree_btable_patch(const int* btable, int* sib_table, int* btab_rows, int mbs,
+                              int sib_row, const int* idx, cudaStream_t stream = nullptr);
+void launch_tree_block_copy(void* pool, const int* btable, const int* idx, size_t block_bytes,
+                            cudaStream_t stream = nullptr);
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream);
 // Packed-decode twin: dst[r][0..n) = row_tables[r][0..n). `row_tables` is a DEVICE array of
 // per-row block-table pointers, so the gather runs inside a graph capture and the captured graph

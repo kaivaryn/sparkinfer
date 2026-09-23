@@ -139,9 +139,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
 // capture_only builds (and instantiates) the replay graph without launching it and without
 // touching any model state -- stream capture records kernels instead of running them. Call it once
 // during session setup so the ~4.9 ms of graph construction does not land on a decode step.
+// TREE DRAFTING. tree_sib_row >= 0 marks the LAST row as a sibling of row 0: a second candidate
+// for the same position as token_ids[1], so the verify can accept either. It shares row 0's
+// position, takes its GDN recurrence from row 0 rather than from the row before it, and reads a
+// paged-KV table whose tail block is swapped for a spare so its own K/V does not collide with
+// the first candidate's. -1 (the default) is the plain chain, and every code path it touches is
+// gated on it.
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
-                            int* out_argmax, bool capture_only = false);
+                            int* out_argmax, bool capture_only = false, int tree_sib_row = -1);
 
 // Release request-scoped verify graphs and their device arena. Call after a speculative
 // generation so the next long prefill sees the same free-VRAM budget as the first one.

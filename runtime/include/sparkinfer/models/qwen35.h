@@ -648,7 +648,8 @@ public:
 
     // Batched verify entry (may fall back to verify_block). Same contract as verify_block.
     bool batched_forward(const int* token_ids, int n, int start_pos, bool resume_gdn,
-                         int* out_argmax, const void* dflash_capture_dst = nullptr);
+                         int* out_argmax, const void* dflash_capture_dst = nullptr,
+                        int tree_sib_row = -1);
 
 private:
     void invalidate_decode_graph();

@@ -2202,6 +2202,57 @@ void launch_gather_rows_i32(const int* const* row_tables, int* dst, int n, int r
         row_tables, dst, n, rows);
 }
 
+// ---- tree drafting: sibling KV redirection -------------------------------------------------
+// A sibling proposal shares its parent's POSITION, so both would land in the same paged-KV slot.
+// The block table is what decides which physical block that slot lives in, so the sibling gets a
+// table of its own whose tail entry points at a spare block. `tail`/`spare` move every step
+// (they follow `start`), so they arrive as device ints -- baking them as host constants would be
+// wrong the moment the verify graph is replayed.
+__global__ void k_tree_btable_patch(const int* __restrict__ btable, int* __restrict__ sib_table,
+                                    int* __restrict__ btab_rows, int mbs, int sib_row,
+                                    const int* __restrict__ idx) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= mbs) return;
+    const int tail = idx[0];                 // logical block holding the sibling's slot
+    const int spare = btable[idx[1]];        // physical block id of the spare
+    const int v = (i == tail) ? spare : btable[i];
+    sib_table[i] = v;
+    // The per-row table the batched flash-decode reads: only the sibling's row is redirected, so
+    // ONE attention launch still covers every row. A second flash-decode for the sibling alone
+    // would re-read the whole KV and cost more than the tree is worth.
+    if (btab_rows) btab_rows[(size_t)sib_row * mbs + i] = v;
+}
+
+// Copy one paged block so the spare carries the tokens that already precede the sibling inside
+// its tail block. Those tokens are from earlier steps and are not rewritten by this one, so the
+// copy is safe anywhere before the sibling's own append.
+__global__ void k_tree_block_copy(char* __restrict__ pool, const int* __restrict__ btable,
+                                  const int* __restrict__ idx, size_t block_bytes) {
+    const size_t n = block_bytes;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t src = (size_t)btable[idx[0]] * n;
+    const size_t dst = (size_t)btable[idx[1]] * n;
+    pool[dst + i] = pool[src + i];
+}
+
+void launch_tree_btable_patch(const int* btable, int* sib_table, int* btab_rows, int mbs,
+                              int sib_row, const int* idx, cudaStream_t stream) {
+    if (mbs <= 0) return;
+    const int thr = 256;
+    k_tree_btable_patch<<<(mbs + thr - 1) / thr, thr, 0, stream>>>(
+        btable, sib_table, btab_rows, mbs, sib_row, idx);
+}
+
+void launch_tree_block_copy(void* pool, const int* btable, const int* idx, size_t block_bytes,
+                            cudaStream_t stream) {
+    if (!pool || block_bytes == 0) return;
+    const int thr = 256;
+    const size_t blocks = (block_bytes + thr - 1) / thr;
+    k_tree_block_copy<<<(unsigned)blocks, thr, 0, stream>>>(
+        reinterpret_cast<char*>(pool), btable, idx, block_bytes);
+}
+
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream) {
     const int total = n * rows;
     if (total <= 0) return;

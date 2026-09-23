@@ -4121,7 +4121,8 @@ void Qwen35Model::dflash_warm_verify(int n, int start_pos) {
 }
 
 bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bool /*resume_gdn*/,
-                                  int* out_argmax, const void* dflash_capture_dst) {
+                                  int* out_argmax, const void* dflash_capture_dst,
+                                  int tree_sib_row) {
     Impl& s = *p_;
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;
@@ -4134,7 +4135,8 @@ bool Qwen35Model::batched_forward(const int* token_ids, int n, int start_pos, bo
                           nullptr, 0, nullptr, 0 };
     const int consumed = dflash_verify_short_run(ctx, token_ids, n, start_pos,
                                                   s.dflash_layer_ids.data(), s.dflash_n_cap,
-                                                  const_cast<void*>(dflash_capture_dst), out_argmax);
+                                                  const_cast<void*>(dflash_capture_dst), out_argmax,
+                                                  false, tree_sib_row);
     return consumed > 0;
 }
 
@@ -4404,7 +4406,9 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
     // posterior[] and draft_ids[] are every one of them indexed at B. Sized B alone, drafting
     // the full block wrote one past the end of all three; draft_confidence already had the
     // extra slot, which is why the overflow never showed up as a confidence bug.
-    std::vector<int> block(B + 1), posterior(B + 1), draft_ids(B + 1);
+    // One slot past the block: tree drafting appends a SIBLING row -- a second candidate for the
+    // same position as block[1] -- after the chain.
+    std::vector<int> block(B + 2), posterior(B + 2), draft_ids(B + 1);
     std::vector<float> draft_confidence(B + 1, 0.f);
     // Proposal depth (also sets the draft's active diffusion width, depth+1). 5 is the measured
     // optimum at short context: accept length rises only 5.33 -> 5.95 -> 6.43 going to depth 6 and
@@ -5010,6 +5014,8 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
         // restore / KV-truncate / replay needed (greedy speculative decoding is exact). Rejected
         // proposals (block[keep..B-1]) are never forwarded, saving ~B-keep target forwards/step.
         int accept = 0, keep = 1;
+        // The draft's SECOND choice for the first proposal. -1 until dflash_draft supplies it.
+        int tree_alt = -1;
         int plan_vn = active_proposal_depth + 1;
         bool vfail = false;
         if (compact_verify) {
@@ -5096,7 +5102,46 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                 vn = best_d + 1;
             }
             auto _tb = std::chrono::steady_clock::now();
-            vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
+            // TREE DRAFTING. A second candidate for position start+1, verified in the SAME pass
+            // as the chain. It costs one extra row -- which the block-scaled GEMMs round up to a
+            // multiple of 8 anyway -- and wins whenever the target's token is the draft's second
+            // choice rather than its first. Measured at ctx 4096: the draft's top-1 carries 46.1%
+            // of steps and its top-2 carries 57.9%, so the sibling newly wins 11.8% of them.
+            //
+            // Mode 2 is a SELF-CHECK, not a speedup: it makes the sibling a duplicate of block[1],
+            // so posterior[sibling] must come out bit-identical to posterior[1]. That exercises
+            // every piece of the branch -- the swapped KV table, the sibling's own append, the
+            // branched GDN recurrence -- against an answer that is known in advance.
+            static const int kTreeMode = []{
+                const char* e = getenv("SPARKINFER_DSPARK_TREE");
+                return e ? atoi(e) : 0;
+            }();
+            int tree_row = -1;
+            if (kTreeMode && vn >= 2 && vn + 1 <= (int)block.size()) {
+                block[vn] = (kTreeMode == 2) ? block[1] : tree_alt;
+                if (block[vn] >= 0) tree_row = vn;
+            }
+            if (tree_row > 0) {
+                vfail = !batched_forward(block.data(), vn + 1, start, false, posterior.data(),
+                                         s.dflash_hidden, tree_row);
+                if (!vfail && kTreeMode == 2) {
+                    static int chk_ok = 0, chk_bad = 0;
+                    (posterior[tree_row] == posterior[1] ? chk_ok : chk_bad)++;
+                    if (chk_bad <= 6 && posterior[tree_row] != posterior[1]) {
+                        fprintf(stderr, "[tree-selfcheck] MISMATCH start=%d vn=%d sib_row=%d "
+                                "sibtok=%d blk1=%d | block=[", start, vn, tree_row,
+                                block[tree_row], block[1]);
+                        for (int z = 0; z <= tree_row; z++) fprintf(stderr, "%d ", block[z]);
+                        fprintf(stderr, "] post=[");
+                        for (int z = 0; z <= tree_row; z++) fprintf(stderr, "%d ", posterior[z]);
+                        fprintf(stderr, "]\n");
+                    }
+                    if (((chk_ok + chk_bad) % 64) == 0)
+                        fprintf(stderr, "[tree-selfcheck] ok=%d bad=%d\n", chk_ok, chk_bad);
+                }
+            } else {
+                vfail = !batched_forward(block.data(), vn, start, false, posterior.data(), s.dflash_hidden);
+            }
             const double vms = std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - _tb).count();
             if (kTiming) { t_batched_ms += vms; n_batched++; }
