@@ -518,6 +518,129 @@ gemm_ptq1_dp4a_xs_kernel(const unsigned char* __restrict__ w, OutT* __restrict__
     if (live && sub == 0) store_out<OutT>(y, row, acc);
 }
 
+// A packed batch of rows against the decode shadow: gemm_ptq1_dp4a_xs_kernel's arithmetic per
+// row -- G=8 lanes per weight row, lane `sub` summing blocks sub, sub+8, ... in that order, the
+// same FMA per block and the same shuffle tree -- so row j of the output is bit-identical to row j
+// decoded alone. What changes is around it: each weight block is decoded once and dotted against
+// every batch row, and the activations come from shared memory, staged KC blocks at a time for
+// all rows. KC is a multiple of G, so a chunk boundary never reorders any lane's blocks. The
+// global-memory form of the same loop (gemm_ptq1_dp4a_kernel at BMAX) spends ~15 us per row on
+// activation fetches and loses to issuing the rows one by one.
+template <typename OutT, int T, int BMAX, int KC>
+__global__ void __launch_bounds__(T)
+gemm_ptq1_dp4a_rows_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y, int n_rows,
+                           int k, int batch, int slot) {
+    constexpr int G = 8;
+    static_assert(KC % G == 0, "a chunk must hold whole rounds of the lanes' block walk");
+    __shared__ __align__(16) unsigned s_lut[256 * 32];
+    extern __shared__ int4 s_x[];   // BMAX * KC staged blocks, then their scales and sums
+    float* s_xs = reinterpret_cast<float*>(s_x + BMAX * KC * kDpXsStride);
+    int* s_xsum = reinterpret_cast<int*>(s_xs + BMAX * KC);
+    for (int e = threadIdx.x; e < 256; e += T) {
+        const unsigned v = dp_lut_entry(e);
+        const int4 v4 = make_int4((int)v, (int)v, (int)v, (int)v);
+        int4* dst = reinterpret_cast<int4*>(s_lut + e * 32);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[(i + threadIdx.x) & 7] = v4;
+    }
+
+    const int lane = threadIdx.x & 31;
+    const unsigned* lut = s_lut + lane;
+    const int row = blockIdx.x * (T / G) + threadIdx.x / G;
+    const int sub = threadIdx.x % G;
+    const bool live = row < n_rows;
+    const int nb = k / kBlockElems;
+    const int4* xq = g_dp_xq[slot];
+    const unsigned* wrow = reinterpret_cast<const unsigned*>(w + (size_t)(live ? row : 0) * nb *
+                                                             kBlockBytes);
+
+    float acc[BMAX];
+#pragma unroll
+    for (int j = 0; j < BMAX; ++j) acc[j] = 0.0f;
+
+    for (int c0 = 0; c0 < nb; c0 += KC) {
+        const int kc = nb - c0 < KC ? nb - c0 : KC;
+        __syncthreads();   // the previous chunk's reads are done
+        for (int i = threadIdx.x; i < batch * kc * 8; i += T) {
+            const int v = i & 7, jb = i >> 3, j = jb / kc, b = jb - j * kc;
+            s_x[(j * KC + b) * kDpXsStride + v] = xq[((size_t)j * nb + c0 + b) * 8 + v];
+        }
+        for (int i = threadIdx.x; i < batch * kc; i += T) {
+            const int j = i / kc, b = i - j * kc;
+            s_xs[j * KC + b] = g_dp_xs[slot][j * nb + c0 + b];
+            s_xsum[j * KC + b] = g_dp_xsum[slot][j * nb + c0 + b];
+        }
+        __syncthreads();
+        if (!live) continue;
+        for (int b = sub; b < kc; b += G) {
+            unsigned wq[7];
+#pragma unroll
+            for (int i = 0; i < 7; ++i) wq[i] = __ldg(wrow + (size_t)(c0 + b) * 7 + i);
+            unsigned C[26], E[6];
+#pragma unroll
+            for (int g = 0; g < 6; ++g) {
+                unsigned L[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    L[i] = lut[((wq[g] >> (8 * i)) & 0xffu) * 32];
+                    C[4 * g + i] = L[i] & 0x03030303u;
+                }
+                const unsigned lo = __byte_perm(L[0], L[1], 0x0040);
+                const unsigned hi = __byte_perm(L[2], L[3], 0x0040);
+                E[g] = (__byte_perm(lo, hi, 0x5410) >> 2) & 0x03030303u;
+            }
+            C[24] = lut[(wq[6] & 0xffu) * 32] & 0x03030303u;
+            C[25] = lut[((wq[6] >> 8) & 0xffu) * 32] & 0x03030303u;
+            const float ws = __half2float(__ushort_as_half((unsigned short)(wq[6] >> 16)));
+#pragma unroll
+            for (int j = 0; j < BMAX; ++j) {
+                if (j >= batch) break;
+                const int4* xb = s_x + (j * KC + b) * kDpXsStride;
+                int X[32];
+#pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const int4 t = xb[v];
+                    X[4 * v] = t.x; X[4 * v + 1] = t.y; X[4 * v + 2] = t.z; X[4 * v + 3] = t.w;
+                }
+                int dot = 0;
+#pragma unroll
+                for (int g = 0; g < 6; ++g) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) dot = __dp4a((int)C[4 * g + i], X[5 * g + i], dot);
+                    dot = __dp4a((int)E[g], X[5 * g + 4], dot);
+                }
+                dot = __dp4a((int)C[24], X[30], dot);
+                dot = __dp4a((int)C[25], X[31], dot);
+                acc[j] += ws * s_xs[j * KC + b] * (float)(dot - s_xsum[j * KC + b]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < BMAX; ++j) {
+#pragma unroll
+        for (int off = G / 2; off > 0; off >>= 1)
+            acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], off);
+        if (live && sub == 0 && j < batch) store_out<OutT>(y + (size_t)j * n_rows, row, acc[j]);
+    }
+}
+
+// Rows per chunk x blocks per chunk is held at 256: a 36 KB activation tile beside the 32 KB table.
+template <typename OutT, int BMAX>
+void launch_dp4a_rows_t(const unsigned char* w, OutT* y, int n_rows, int k, int batch, int slot,
+                        cudaStream_t stream) {
+    constexpr int T = 256, KC = 256 / BMAX;
+    constexpr size_t smem = dp_xs_smem(BMAX * KC);
+    static const bool attr = [] {
+        cudaFuncSetAttribute(gemm_ptq1_dp4a_rows_kernel<OutT, T, BMAX, KC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        return true;
+    }();
+    (void)attr;
+    const unsigned grid = (unsigned)((n_rows + T / 8 - 1) / (T / 8));
+    gemm_ptq1_dp4a_rows_kernel<OutT, T, BMAX, KC><<<grid, T, smem, stream>>>(w, y, n_rows, k,
+                                                                            batch, slot);
+}
+
 // SPARKINFER_PTQ1_XSFAST=0 keeps batch 1 on gemm_ptq1_dp4a_kernel, for an A/B out of one binary.
 bool ptq1_xsfast_on() {
     static const bool v = [] {
@@ -598,14 +721,17 @@ constexpr int kRqThreads = 256;
 
 __global__ void __launch_bounds__(kRqThreads)
 ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
-                         const signed char* __restrict__ sign, float norm, int slot) {
+                         const signed char* __restrict__ sign, float norm, int k, int slot) {
     __shared__ float sh[kRqBlock];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    const int base = blockIdx.x * kRqBlock;
+    // blockIdx.y is the batch row: its own k-wide span of x and y and its own run of blocks in
+    // the slot, laid out as ptq1_dp_quant_kernel lays out row j. The sign vector is shared.
+    const int span = blockIdx.x * kRqBlock;
+    const size_t base = (size_t)blockIdx.y * k + span;
     float v[4];
     {
         const uint2 raw = *reinterpret_cast<const uint2*>(x + base + 4 * t);
-        const char4 sg = *reinterpret_cast<const char4*>(sign + base + 4 * t);
+        const char4 sg = *reinterpret_cast<const char4*>(sign + span + 4 * t);
         const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
         const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
         v[0] = __low2float(lo) * (float)sg.x;
@@ -666,7 +792,7 @@ ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __r
         sum += qi;
         word |= (qi & 0xff) << (8 * i);
     }
-    const int b = blockIdx.x * (kRqBlock / kBlockElems) + warp;
+    const int b = blockIdx.y * (k / kBlockElems) + blockIdx.x * (kRqBlock / kBlockElems) + warp;
     reinterpret_cast<int*>(g_dp_xq[slot])[b * (kBlockElems / 4) + lane] = word;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
@@ -847,8 +973,38 @@ int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char
     const int slot = next_dp_slot();
     ptq1_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
-        sign, rsqrtf((float)block), slot);
+        sign, rsqrtf((float)block), k, slot);
     return slot;
+}
+
+int launch_ptq1_rotate_quant_rows(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                                  int batch, int block, cudaStream_t stream) {
+    if (!ptq1_rotq_on() || !ptq1_dp4a_on() || block != kRqBlock || k <= 0 || k % kRqBlock != 0 ||
+        k > kDpMaxK || batch < 1 || batch > kDpMaxBatch)
+        return -1;
+    const int slot = next_dp_slot();
+    ptq1_rotate_quant_kernel<<<dim3((unsigned)(k / kRqBlock), (unsigned)batch), kRqThreads, 0,
+                               stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
+        sign, rsqrtf((float)block), k, slot);
+    return slot;
+}
+
+bool launch_gemm_ptq1_q(int handle, const void* w_ptq1, void* y_bf16, int n_rows, int k,
+                        int batch, cudaStream_t stream) {
+    const auto* wb = reinterpret_cast<const unsigned char*>(w_ptq1);
+    if (handle < 0 || n_rows <= 0 || k <= 0 || k % kBlockElems != 0 || k > kDpMaxK ||
+        batch < 1 || batch > kDpMaxBatch || (reinterpret_cast<uintptr_t>(w_ptq1) & 3) != 0)
+        return false;
+    // G=8, the lane split every single-row shadow GEMV runs (launch_gemv_q_typed): same blocks
+    // per lane, same order, same shuffle tree, so each row is its alone result bit for bit.
+    auto* y = reinterpret_cast<__nv_bfloat16*>(y_bf16);
+    if (batch <= 2)       launch_dp4a_rows_t<__nv_bfloat16, 2>(wb, y, n_rows, k, batch, handle, stream);
+    else if (batch <= 4)  launch_dp4a_rows_t<__nv_bfloat16, 4>(wb, y, n_rows, k, batch, handle, stream);
+    else if (batch <= 8)  launch_dp4a_rows_t<__nv_bfloat16, 8>(wb, y, n_rows, k, batch, handle, stream);
+    else if (batch <= 16) launch_dp4a_rows_t<__nv_bfloat16, 16>(wb, y, n_rows, k, batch, handle, stream);
+    else                  launch_dp4a_rows_t<__nv_bfloat16, 32>(wb, y, n_rows, k, batch, handle, stream);
+    return true;
 }
 
 void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void* y_bf16,

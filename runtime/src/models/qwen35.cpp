@@ -4270,6 +4270,13 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
     ctx.packed_lin_state = reinterpret_cast<float* const*>(s.packed_dev_states);
     ctx.packed_lin_conv  = reinterpret_cast<void* const*>(s.packed_dev_convs);
     ctx.packed_state_b16 = packed_state_b16;
+    // SPARKINFER_BONSAI_CB_SHADOW=0 keeps the packed FFN on the folded weights, for an A/B.
+    static const bool kCbShadow = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW");
+        return !(e && e[0] == '0');
+    }();
+    if (kCbShadow && !s.bonsai_dec_layers.empty())
+        ctx.bonsai_dec_layers = s.bonsai_dec_layers.data();
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
                                                  nullptr, 0, nullptr, out_sampled);
     return consumed == n;

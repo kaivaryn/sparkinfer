@@ -47,6 +47,14 @@ void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void
                         int n_rows, int k, cudaStream_t stream);
 void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,
                             int n_rows, int k, cudaStream_t stream);
+// The same pair over `batch` rows of x (row j at x + j*k), each row rotated and quantized exactly
+// as launch_ptq1_rotate_quant does it alone, and a GEMM whose row j is bit-identical to
+// launch_gemv_ptq1_q on that row. So a packed batch can read the decode shadow and still decode
+// every row as it would alone. -1 / false: not taken (dp4a off, a shape it does not cover).
+int launch_ptq1_rotate_quant_rows(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                                  int batch, int block, cudaStream_t stream);
+bool launch_gemm_ptq1_q(int handle, const void* w_ptq1, void* y_bf16, int n_rows, int k,
+                        int batch, cudaStream_t stream);
 
 // A whole weight matrix decoded out of its ternary blocks and un-rotated into the architecture's
 // basis, as ordinary bf16. Prefill uses this rather than a ternary GEMM so its existing projection
