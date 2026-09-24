@@ -265,6 +265,44 @@ __host__ __device__ constexpr size_t dp_xs_smem(int nb) {
     return (size_t)nb * kDpXsStride * sizeof(int4) + (size_t)nb * (sizeof(float) + sizeof(int));
 }
 
+// One weight block against one activation block: the table decode of the 26 carrier bytes and
+// the 32 dp4a over the permuted int8 activation. Returns the raw integer dot; the caller applies
+// scales and the xsum correction.
+__device__ __forceinline__ int dp_block_dot(const unsigned* wq, const unsigned* lut,
+                                            const int4* xb) {
+    unsigned C[26], E[6];
+#pragma unroll
+    for (int g = 0; g < 6; ++g) {
+        unsigned L[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            L[i] = lut[((wq[g] >> (8 * i)) & 0xffu) * 32];
+            C[4 * g + i] = L[i] & 0x03030303u;
+        }
+        const unsigned lo = __byte_perm(L[0], L[1], 0x0040);
+        const unsigned hi = __byte_perm(L[2], L[3], 0x0040);
+        E[g] = (__byte_perm(lo, hi, 0x5410) >> 2) & 0x03030303u;
+    }
+    C[24] = lut[(wq[6] & 0xffu) * 32] & 0x03030303u;
+    C[25] = lut[((wq[6] >> 8) & 0xffu) * 32] & 0x03030303u;
+    int X[32];
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+        const int4 t = xb[v];
+        X[4 * v] = t.x; X[4 * v + 1] = t.y; X[4 * v + 2] = t.z; X[4 * v + 3] = t.w;
+    }
+    int dot = 0;
+#pragma unroll
+    for (int g = 0; g < 6; ++g) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) dot = __dp4a((int)C[4 * g + i], X[5 * g + i], dot);
+        dot = __dp4a((int)E[g], X[5 * g + 4], dot);
+    }
+    dot = __dp4a((int)C[24], X[30], dot);
+    dot = __dp4a((int)C[25], X[31], dot);
+    return dot;
+}
+
 // G lanes per weight row, each taking whole 28-byte blocks b = sub, sub+G, ...
 // XS (batch 1 only): the CTA copies the quantized activation, its scales and sums into shared
 // memory once instead of every lane fetching its 128-byte block through L1 per weight block.
@@ -407,6 +445,110 @@ void launch_dp4a_xs(const unsigned char* w, OutT* y, int n_rows, int k, int slot
                     cudaStream_t stream) {
     if (n_rows > 65536) launch_dp4a_xs_g<OutT, 16>(w, y, n_rows, k, slot, stream);
     else                launch_dp4a_xs_g<OutT, 8>(w, y, n_rows, k, slot, stream);
+}
+
+// Batch 1 with the activation staged, as gemm_ptq1_dp4a_kernel<OutT, 8, 1, true>, with the same
+// lanes owning the same blocks in the same order and the same shuffle tree -- bit-identical rows --
+// but a cheaper CTA around them:
+//   * The table is built one entry per thread, each writing its 32 copies with four-word stores.
+//     The old build computed every entry 32 times over; for gate/up that prologue cost as much as
+//     the ~5 blocks each lane then reads.
+//   * T threads per CTA. 512 amortizes the table over 64 rows (gate/up, 16.4 -> 13.8 us isolated);
+//     down's 17408-wide activation leaves room for one CTA per SM, so it stays at 256.
+//   * D blocks' weights are loaded before any is decoded. Down's lanes walk 17 blocks each at 8
+//     warps per SM, so its loop is load-latency bound; D=2 there, 15.5 -> 14.6 us.
+template <typename OutT, int T, int D>
+__global__ void __launch_bounds__(T)
+gemm_ptq1_dp4a_xs_kernel(const unsigned char* __restrict__ w, OutT* __restrict__ y, int n_rows,
+                         int k, int slot) {
+    constexpr int G = 8;
+    __shared__ __align__(16) unsigned s_lut[256 * 32];
+    extern __shared__ int4 s_x[];
+    for (int e = threadIdx.x; e < 256; e += T) {
+        const unsigned v = dp_lut_entry(e);
+        const int4 v4 = make_int4((int)v, (int)v, (int)v, (int)v);
+        int4* dst = reinterpret_cast<int4*>(s_lut + e * 32);
+        // Rotated so a quarter-warp's eight 16-byte stores land in eight different bank groups.
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[(i + threadIdx.x) & 7] = v4;
+    }
+
+    const int lane = threadIdx.x & 31;
+    const unsigned* lut = s_lut + lane;
+    const int row = blockIdx.x * (T / G) + threadIdx.x / G;
+    const int sub = threadIdx.x % G;
+    const bool live = row < n_rows;
+    const int nb = k / kBlockElems;
+    float* sxs = reinterpret_cast<float*>(s_x + nb * kDpXsStride);
+    int* sxsum = reinterpret_cast<int*>(sxs + nb);
+    {
+        const int4* xq = g_dp_xq[slot];
+        for (int i = threadIdx.x; i < nb * 8; i += T) s_x[(i >> 3) * kDpXsStride + (i & 7)] = xq[i];
+        for (int i = threadIdx.x; i < nb; i += T) {
+            sxs[i] = g_dp_xs[slot][i];
+            sxsum[i] = g_dp_xsum[slot][i];
+        }
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    if (live) {
+        const unsigned* wrow =
+            reinterpret_cast<const unsigned*>(w + (size_t)row * nb * kBlockBytes);
+        for (int b0 = sub; b0 < nb; b0 += G * D) {
+            unsigned wq[D][7];
+#pragma unroll
+            for (int d = 0; d < D; ++d)
+                if (b0 + d * G < nb) {
+#pragma unroll
+                    for (int i = 0; i < 7; ++i) wq[d][i] = __ldg(wrow + (size_t)(b0 + d * G) * 7 + i);
+                }
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+                const int b = b0 + d * G;
+                if (b >= nb) break;
+                const int dot = dp_block_dot(wq[d], lut, s_x + (size_t)b * kDpXsStride);
+                const float ws = __half2float(__ushort_as_half((unsigned short)(wq[d][6] >> 16)));
+                acc += ws * sxs[b] * (float)(dot - sxsum[b]);
+            }
+        }
+    }
+#pragma unroll
+    for (int off = G / 2; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    if (live && sub == 0) store_out<OutT>(y, row, acc);
+}
+
+// SPARKINFER_PTQ1_XSFAST=0 keeps batch 1 on gemm_ptq1_dp4a_kernel, for an A/B out of one binary.
+bool ptq1_xsfast_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_XSFAST");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+
+template <typename OutT, int T, int D>
+void launch_dp4a_xsfast_t(const unsigned char* w, OutT* y, int n_rows, int k, int slot,
+                          cudaStream_t stream) {
+    static const bool attr = [] {
+        cudaFuncSetAttribute(gemm_ptq1_dp4a_xs_kernel<OutT, T, D>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)dp_xs_smem(kDpMaxK / kBlockElems));
+        return true;
+    }();
+    (void)attr;
+    const unsigned grid = (unsigned)((n_rows + T / 8 - 1) / (T / 8));
+    gemm_ptq1_dp4a_xs_kernel<OutT, T, D><<<grid, T, dp_xs_smem(k / kBlockElems), stream>>>(
+        w, y, n_rows, k, slot);
+}
+
+// Narrow inputs (<= 64 blocks: gate/up at 5120) take the wide CTA; wide ones (down at 17408) the
+// 256-thread CTA with paired loads.
+template <typename OutT>
+void launch_dp4a_xsfast(const unsigned char* w, OutT* y, int n_rows, int k, int slot,
+                        cudaStream_t stream) {
+    if (k / kBlockElems <= 64) launch_dp4a_xsfast_t<OutT, 512, 1>(w, y, n_rows, k, slot, stream);
+    else                       launch_dp4a_xsfast_t<OutT, 256, 2>(w, y, n_rows, k, slot, stream);
 }
 
 template <typename OutT, int BMAX>
@@ -677,6 +819,10 @@ void launch_gemv_q_typed(int handle, const void* x, const void* w, OutT* y, int 
         if (!launch_dp4a<OutT>(reinterpret_cast<const __nv_bfloat16*>(x), wb, y, n_rows, k, 1,
                                stream))
             launch_typed<OutT>(x, w, y, n_rows, k, 1, stream);
+        return;
+    }
+    if (ptq1_xsmem_on() && ptq1_xsfast_on() && n_rows <= 65536) {
+        launch_dp4a_xsfast<OutT>(wb, y, n_rows, k, handle, stream);
         return;
     }
     if (ptq1_xsmem_on()) {
