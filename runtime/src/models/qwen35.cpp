@@ -1868,12 +1868,15 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         if (pf_win & 1) pf_fork_n(w.wo, nullptr, pf_wo_bytes);
         dbg_bf16(s.xn, H, 10, L);   // tag 10: pre-attn-norm output (this layer's normed input)
         dbg_xn_snapshot(s.xn, L);
+        int xn_ptq1_q = -1;
         if (s.bonsai_rot_xn) {
             // Once, on the main stream, before the projections fan out across stream_k/stream_v.
+            // It also leaves the int8 copy every ternary projection below reads (-1: it did not,
+            // and each GEMV quantizes for itself as before).
             const auto it = s.bonsai_sign_dev.find(H);
-            kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot_xn,
-                                                 static_cast<const signed char*>(it->second),
-                                                 H, (int)H, (int)s.bonsai_block, st);
+            xn_ptq1_q = kernels::launch_ptq1_rotate_quant(
+                s.xn, s.bonsai_rot_xn, static_cast<const signed char*>(it->second), (int)H,
+                (int)s.bonsai_block, st);
             // tag 15: the rotated xn. R is orthogonal, so this l2 must equal tag 10's exactly --
             // a cheap in-model check that the rotation is what the isolated test says it is.
             dbg_bf16(s.bonsai_rot_xn, H, 15, L);
@@ -1931,7 +1934,7 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         kernels::launch_gemv_nvfp4(s.xn, W, y, N, H, pst);
                 }
                 else if (t == kPtq1GgmlType && s.bonsai_rot_xn)
-                    kernels::launch_gemv_ptq1(s.bonsai_rot_xn, W, y, N, H, pst);
+                    kernels::launch_gemv_ptq1_q(xn_ptq1_q, s.bonsai_rot_xn, W, y, N, H, pst);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, pst);
                 else        kernels::launch_gemv(s.xn, W, y, N, H, pst);
             } else {
@@ -2548,18 +2551,20 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             // permits aliasing, and each CTA owns its whole 1024-span.
             if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType &&
                 w.down_qtype == kPtq1GgmlType && s.bonsai_ffn_h && c.top_k == 1) {
-                kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
-                                                     H, (int)H, (int)s.bonsai_block, st);
-                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
-                                          c.moe_ffn, H, st);
-                kernels::launch_gemv_ptq1(s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
-                                          c.moe_ffn, H, st);
+                // Gate and up share one int8 copy of the rotated hn, made by the rotation.
+                const int hq = kernels::launch_ptq1_rotate_quant(
+                    s.hn, s.bonsai_rot_hn, s.bonsai_sign_h, (int)H, (int)s.bonsai_block, st);
+                kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.gate_q, s.bonsai_ffn_gate,
+                                            c.moe_ffn, H, st);
+                kernels::launch_gemv_ptq1_q(hq, s.bonsai_rot_hn, w.up_q, s.bonsai_ffn_up,
+                                            c.moe_ffn, H, st);
                 kernels::launch_prefill_swiglu(s.bonsai_ffn_gate, s.bonsai_ffn_up,
                                                s.bonsai_ffn_h, c.moe_ffn, st);
-                kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
-                                                     s.bonsai_sign_ffn, c.moe_ffn,
-                                                     (int)c.moe_ffn, (int)s.bonsai_block, st);
-                kernels::launch_gemv_ptq1(s.bonsai_ffn_h, w.down_q, s.routed, H, c.moe_ffn, st);
+                const int fq = kernels::launch_ptq1_rotate_quant(
+                    s.bonsai_ffn_h, s.bonsai_ffn_h, s.bonsai_sign_ffn, (int)c.moe_ffn,
+                    (int)s.bonsai_block, st);
+                kernels::launch_gemv_ptq1_q(fq, s.bonsai_ffn_h, w.down_q, s.routed, H,
+                                            c.moe_ffn, st);
             } else
             if (w.gate_nv && w.up_nv && w.down_nv && c.top_k == 1) {
                 // dp4a NVFP4 (SPARKINFER_QWEN38_NVFP4_DP4A=0 restores the float GEMVs). The
@@ -2794,9 +2799,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     if (s.bonsai_dec_head) {
         // The decode shadow's ternary head: rotate xn into the weights' basis, as the native
         // branch below does, and read 0.21875 bytes/weight instead of the folded head's Q4_K.
-        kernels::launch_hadamard_rotate_bf16(s.xn, s.bonsai_rot, s.bonsai_sign_h,
-                                             H, (int)H, (int)s.bonsai_block, st);
-        kernels::launch_gemv_ptq1_f32(s.bonsai_rot, s.bonsai_dec_head, s.logits, c.vocab, H, st);
+        const int hq = kernels::launch_ptq1_rotate_quant(s.xn, s.bonsai_rot, s.bonsai_sign_h,
+                                                         (int)H, (int)s.bonsai_block, st);
+        kernels::launch_gemv_ptq1_q_f32(hq, s.bonsai_rot, s.bonsai_dec_head, s.logits, c.vocab,
+                                        H, st);
     }
     else if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
         if (!fnq || c.muse_glimmer) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);

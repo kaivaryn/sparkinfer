@@ -1,6 +1,7 @@
 // GEMV against PTQ1_0 ternary weights, read in their stored 28-byte blocks.
 // See sparkinfer/kernels/ternary.h for the format and for the basis the activation must be in.
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/kernels/hadamard.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -367,6 +368,12 @@ bool ptq1_dp4a_on() {
     return v;
 }
 
+// One round-robin over the scratch slots for every launch that quantizes, bf16 or f32 output.
+int next_dp_slot() {
+    static std::atomic<unsigned> next{0};
+    return (int)(next.fetch_add(1, std::memory_order_relaxed) % kDpSlots);
+}
+
 // SPARKINFER_PTQ1_XSMEM=0 keeps batch 1 on the per-lane activation fetches, for an A/B.
 bool ptq1_xsmem_on() {
     static const bool v = [] {
@@ -415,14 +422,13 @@ template <typename OutT>
 bool launch_dp4a(const __nv_bfloat16* x, const unsigned char* w, OutT* y, int n_rows, int k,
                  int batch, cudaStream_t stream) {
     if (!ptq1_dp4a_on() || k > kDpMaxK || (reinterpret_cast<uintptr_t>(w) & 3) != 0) return false;
-    static std::atomic<unsigned> next_slot{0};
     const int nb = k / kBlockElems;
     // Enough CTAs to cover the SMs twice over, with no more lanes per row than it has blocks.
     int g = 8;
     while (g < 32 && (long)n_rows * g / kDpThreads < 340 && nb >= 2 * g) g *= 2;
     for (int b0 = 0; b0 < batch; b0 += kDpMaxBatch) {
         const int m = batch - b0 < kDpMaxBatch ? batch - b0 : kDpMaxBatch;
-        const int slot = (int)(next_slot.fetch_add(1, std::memory_order_relaxed) % kDpSlots);
+        const int slot = next_dp_slot();
         ptq1_dp_quant_kernel<<<dim3((unsigned)nb, (unsigned)m), kBlockElems, 0, stream>>>(
             x + (size_t)b0 * k, k, slot);
         OutT* yc = y + (size_t)b0 * n_rows;
@@ -435,6 +441,106 @@ bool launch_dp4a(const __nv_bfloat16* x, const unsigned char* w, OutT* y, int n_
         else             launch_dp4a_g<OutT, 32>(w, yc, n_rows, k, m, slot, g, stream);
     }
     return true;
+}
+
+// ----- rotation and activation quant in one launch (batch 1, block 1024) -----
+//
+// hadamard_span_kernel<true> followed by ptq1_dp_quant_kernel, per 1024-span CTA. The butterfly
+// runs its stages in the same order with the same operands -- stages 0-1 in registers, 2-6 across
+// lanes, 7-9 through shared memory -- so y is the bit-identical bf16, and the quant reads those
+// rounded values back with the quant kernel's own arithmetic, so the int8 copy is identical too.
+// Decode rotated each activation once and then quantized it once per GEMV that read it: two to
+// four dependent ~1.3 us launches per rotation on the main stream.
+constexpr int kRqBlock = 1024;
+constexpr int kRqThreads = 256;
+
+__global__ void __launch_bounds__(kRqThreads)
+ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
+                         const signed char* __restrict__ sign, float norm, int slot) {
+    __shared__ float sh[kRqBlock];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int base = blockIdx.x * kRqBlock;
+    float v[4];
+    {
+        const uint2 raw = *reinterpret_cast<const uint2*>(x + base + 4 * t);
+        const char4 sg = *reinterpret_cast<const char4*>(sign + base + 4 * t);
+        const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+        const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+        v[0] = __low2float(lo) * (float)sg.x;
+        v[1] = __high2float(lo) * (float)sg.y;
+        v[2] = __low2float(hi) * (float)sg.z;
+        v[3] = __high2float(hi) * (float)sg.w;
+    }
+    // Stages 0 and 1: element 4t+r pairs with r^1, then r^2; the low index keeps a+b.
+    {
+        const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
+        v[0] = a0 + a1; v[1] = a0 - a1; v[2] = a2 + a3; v[3] = a2 - a3;
+    }
+    {
+        const float a0 = v[0], a1 = v[1], a2 = v[2], a3 = v[3];
+        v[0] = a0 + a2; v[2] = a0 - a2; v[1] = a1 + a3; v[3] = a1 - a3;
+    }
+    // Stages 2-6: bit s of the index is bit s-2 of the lane.
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        const bool hi = (lane & m) != 0;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[r], m);
+            v[r] = hi ? o - v[r] : v[r] + o;
+        }
+    }
+    *reinterpret_cast<float4*>(sh + 4 * t) = make_float4(v[0], v[1], v[2], v[3]);
+    __syncthreads();
+    // Stages 7-9: across warps, exactly as hadamard_span_kernel does them.
+    for (int len = 128; len < kRqBlock; len <<= 1) {
+        for (int i = t; i < kRqBlock / 2; i += kRqThreads) {
+            const int lo = ((i / len) * 2 * len) + (i % len);
+            const int hi = lo + len;
+            const float a = sh[lo], b = sh[hi];
+            sh[lo] = a + b;
+            sh[hi] = a - b;
+        }
+        __syncthreads();
+    }
+    for (int i = t; i < kRqBlock; i += kRqThreads) {
+        const __nv_bfloat16 o = __float2bfloat16(sh[i] * norm);
+        y[base + i] = o;
+        sh[i] = __bfloat162float(o);
+    }
+    __syncthreads();
+    // Quant: warp w takes 128-block w of the span; lane holds permuted positions 4*lane..+3.
+    const float* blk = sh + warp * kBlockElems;
+    float q[4], a = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { q[i] = blk[dp_perm_src(4 * lane + i)]; a = fmaxf(a, fabsf(q[i])); }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+    const float inv = a > 0.f ? 127.f / a : 0.f;
+    int word = 0, sum = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int qi = max(-127, min(127, __float2int_rn(q[i] * inv)));
+        sum += qi;
+        word |= (qi & 0xff) << (8 * i);
+    }
+    const int b = blockIdx.x * (kRqBlock / kBlockElems) + warp;
+    reinterpret_cast<int*>(g_dp_xq[slot])[b * (kBlockElems / 4) + lane] = word;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    if (lane == 0) {
+        g_dp_xsum[slot][b] = sum;
+        g_dp_xs[slot][b] = a / 127.f;
+    }
+}
+
+// SPARKINFER_PTQ1_ROTQ=0 keeps the separate rotation and per-GEMV quant, for an A/B.
+bool ptq1_rotq_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROTQ");
+        return !(e && e[0] == '0');
+    }();
+    return v;
 }
 
 // Embedding lookup and un-rotation in one pass, keeping float across the transform. Decoding to
@@ -559,7 +665,50 @@ void launch_typed(const void* x, const void* w, OutT* y, int n_rows, int k, int 
     }
 }
 
+template <typename OutT>
+void launch_gemv_q_typed(int handle, const void* x, const void* w, OutT* y, int n_rows, int k,
+                         cudaStream_t stream) {
+    const auto* wb = reinterpret_cast<const unsigned char*>(w);
+    if (handle < 0 || n_rows <= 0 || k > kDpMaxK || (reinterpret_cast<uintptr_t>(w) & 3) != 0) {
+        launch_typed<OutT>(x, w, y, n_rows, k, 1, stream);
+        return;
+    }
+    if (ptq1_xsmem_on()) {
+        launch_dp4a_xs<OutT>(wb, y, n_rows, k, handle, stream);
+        return;
+    }
+    const int nb = k / kBlockElems;
+    int g = 8;
+    while (g < 32 && (long)n_rows * g / kDpThreads < 340 && nb >= 2 * g) g *= 2;
+    launch_dp4a_g<OutT, 1>(wb, y, n_rows, k, 1, handle, g, stream);
+}
+
 }  // namespace
+
+int launch_ptq1_rotate_quant(const void* x_bf16, void* y_bf16, const signed char* sign, int k,
+                             int block, cudaStream_t stream) {
+    if (!ptq1_rotq_on() || !ptq1_dp4a_on() || block != kRqBlock || k <= 0 || k % kRqBlock != 0 ||
+        k > kDpMaxK) {
+        launch_hadamard_rotate_bf16(x_bf16, y_bf16, sign, k, k, block, stream);
+        return -1;
+    }
+    const int slot = next_dp_slot();
+    ptq1_rotate_quant_kernel<<<(unsigned)(k / kRqBlock), kRqThreads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), reinterpret_cast<__nv_bfloat16*>(y_bf16),
+        sign, rsqrtf((float)block), slot);
+    return slot;
+}
+
+void launch_gemv_ptq1_q(int handle, const void* x_bf16, const void* w_ptq1, void* y_bf16,
+                        int n_rows, int k, cudaStream_t stream) {
+    launch_gemv_q_typed<__nv_bfloat16>(handle, x_bf16, w_ptq1,
+                                       reinterpret_cast<__nv_bfloat16*>(y_bf16), n_rows, k, stream);
+}
+
+void launch_gemv_ptq1_q_f32(int handle, const void* x_bf16, const void* w_ptq1, float* y_f32,
+                            int n_rows, int k, cudaStream_t stream) {
+    launch_gemv_q_typed<float>(handle, x_bf16, w_ptq1, y_f32, n_rows, k, stream);
+}
 
 void launch_gemv_ptq1(const void* x_bf16, const void* w_ptq1, void* y_bf16,
                       int n_rows, int k, cudaStream_t stream) {
